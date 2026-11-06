@@ -30,6 +30,7 @@ struct NupSpillFile {
     std::filesystem::path path;
     Common::FS::IOFile file;
     bool attempted{};
+    bool remove_on_close{true};
 };
 
 /// LRU over decompressed zstd extents, shared by the files of one container.
@@ -44,6 +45,8 @@ struct NupDecompressCache {
     std::size_t bytes{};
     std::size_t cap{DefaultCap};
     std::filesystem::path spill_dir;
+    bool persistent_spills{};
+    bool cleaned_stale_tmps{};
     std::unordered_map<std::size_t, std::shared_ptr<NupSpillFile>> spills;
 
     std::vector<u8>* Find(std::size_t file_index) {

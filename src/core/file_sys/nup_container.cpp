@@ -154,11 +154,12 @@ bool Sha256(const u8* data, std::size_t size, std::array<u8, 0x20>& out) {
 class NupVfsFile final : public VfsFile {
 public:
     NupVfsFile(VirtualFile backing_, u64 extent_offset_, u64 extent_size_, u64 uncompressed_size_,
-               std::string name_, std::shared_ptr<NupDecompressCache> cache_,
-               std::size_t cache_index_)
+               const std::array<u8, 0x20>& sha256_, std::string name_,
+               std::shared_ptr<NupDecompressCache> cache_, std::size_t cache_index_)
         : backing(std::move(backing_)), extent_offset(extent_offset_), extent_size(extent_size_),
-          uncompressed_size(uncompressed_size_), name(std::move(name_)), cache(std::move(cache_)),
-          cache_index(cache_index_), cache_enabled(uncompressed_size <= cache->cap / 2) {}
+          uncompressed_size(uncompressed_size_), sha256(sha256_), name(std::move(name_)),
+          cache(std::move(cache_)), cache_index(cache_index_),
+          cache_enabled(uncompressed_size <= cache->cap / 2) {}
 
     std::string GetName() const override {
         return name;
@@ -233,6 +234,17 @@ private:
         std::shared_ptr<NupSpillFile> spill;
         {
             std::scoped_lock lock{cache->mutex};
+            if (cache->persistent_spills && !cache->cleaned_stale_tmps) {
+                cache->cleaned_stale_tmps = true;
+                std::error_code iter_ec;
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(cache->spill_dir, iter_ec)) {
+                    if (entry.path().extension() == ".tmp") {
+                        std::error_code rm_ec;
+                        std::filesystem::remove(entry.path(), rm_ec);
+                    }
+                }
+            }
             spill = cache->GetSpill(cache_index);
         }
         std::scoped_lock lock{spill->mutex};
@@ -254,17 +266,42 @@ private:
             if (!spill.path.empty()) {
                 std::error_code ec;
                 std::filesystem::remove(spill.path, ec);
+                spill.path.clear();
             }
         };
         if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
             return fail("extent out of range");
         }
 
-        std::random_device random;
         std::error_code ec;
         std::filesystem::create_directories(cache->spill_dir, ec);
+
+        std::filesystem::path cache_path;
+        if (cache->persistent_spills) {
+            static constexpr char HexDigits[] = "0123456789abcdef";
+            std::string hex_hash;
+            hex_hash.reserve(sha256.size() * 2);
+            for (const u8 b : sha256) {
+                hex_hash.push_back(HexDigits[b >> 4]);
+                hex_hash.push_back(HexDigits[b & 0xF]);
+            }
+            cache_path =
+                cache->spill_dir / fmt::format("{}-{:x}.cache", hex_hash, uncompressed_size);
+            std::error_code size_ec;
+            if (std::filesystem::file_size(cache_path, size_ec) == uncompressed_size && !size_ec) {
+                spill.file.Open(cache_path, Common::FS::FileAccessMode::Read);
+                if (spill.file.IsOpen()) {
+                    spill.path = std::move(cache_path);
+                    spill.remove_on_close = false;
+                    return;
+                }
+            }
+        }
+
+        std::random_device random;
         spill.path =
             cache->spill_dir / fmt::format("{:08x}{:08x}-{}.tmp", random(), random(), cache_index);
+        spill.remove_on_close = true;
         Common::FS::IOFile out{spill.path, Common::FS::FileAccessMode::Write};
         if (!out.IsOpen()) {
             return fail("cannot create the temporary file");
@@ -305,6 +342,14 @@ private:
             return fail("size mismatch");
         }
         out.Close();
+        if (!cache_path.empty()) {
+            std::error_code rename_ec;
+            std::filesystem::rename(spill.path, cache_path, rename_ec);
+            if (!rename_ec) {
+                spill.path = std::move(cache_path);
+                spill.remove_on_close = false;
+            }
+        }
         spill.file.Open(spill.path, Common::FS::FileAccessMode::Read);
         if (!spill.file.IsOpen()) {
             fail("cannot reopen the temporary file");
@@ -334,6 +379,7 @@ private:
     u64 extent_offset;
     u64 extent_size;
     u64 uncompressed_size;
+    std::array<u8, 0x20> sha256;
     std::string name;
     std::shared_ptr<NupDecompressCache> cache;
     std::size_t cache_index;
@@ -344,7 +390,7 @@ private:
 
 NupSpillFile::~NupSpillFile() {
     file.Close();
-    if (!path.empty()) {
+    if (remove_on_close && !path.empty()) {
         std::error_code ec;
         std::filesystem::remove(path, ec);
     }
@@ -363,6 +409,7 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
                            std::filesystem::path spill_dir_)
     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
     cache->cap = memory_cache_cap;
+    cache->persistent_spills = spill_dir_.empty();
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
                            : std::move(spill_dir_);
@@ -715,7 +762,7 @@ VirtualFile NupContainer::OpenFile(std::size_t file_index) {
             static_cast<std::size_t>(node.extent_offset), node.name);
     }
     return std::make_shared<NupVfsFile>(file, node.extent_offset, node.extent_size, node.size,
-                                        node.name, cache, file_index);
+                                        node.sha256, node.name, cache, file_index);
 }
 
 void NupContainer::BuildDirTree(u32 dir_index, VectorVfsDirectory& out) {
