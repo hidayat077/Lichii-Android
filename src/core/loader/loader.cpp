@@ -115,6 +115,10 @@ bool HasApplicationProgramContent(const std::shared_ptr<FileSys::NSP>& nsp) {
         return false;
     }
 
+    if (nsp->IsExtractedType()) {
+        return nsp->GetProgramStatus() == ResultStatus::Success;
+    }
+
     const auto& ncas = nsp->GetNCAs();
     return std::any_of(ncas.cbegin(), ncas.cend(), [](const auto& title_entry) {
         const auto& nca_map = title_entry.second;
@@ -209,7 +213,7 @@ FileType GuessFromFilename(const std::string& name) {
         return FileType::XCI;
     else if (extension == "xcz")
         return FileType::XCZ;
-    else if (extension == "nsp")
+    else if (extension == "nsp" || extension == "nx2")
         return FileType::NSP;
     else if (extension == "nup")
         return FileType::NUP;

@@ -29,7 +29,9 @@ class AppLoader_DeconstructedRomDirectory final : public AppLoader {
 public:
     explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile main_file, bool override_update_ = false);
     // Overload to accept exefs directory. Must contain 'main' and 'main.npdm'
-    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory, bool override_update_ = false);
+    explicit AppLoader_DeconstructedRomDirectory(FileSys::VirtualDir directory,
+                                                 bool override_update_ = false,
+                                                 bool read_dump_metadata = false);
 
     /**
      * Identifies whether or not the given file is a deconstructed ROM directory.
@@ -58,6 +60,8 @@ public:
     ResultStatus ReadNSOModules(Modules& out_modules) override;
 
 private:
+    void ReadDumpMetadata(const FileSys::VirtualDir& file_dir);
+
     /// The loose RomFS next to the ExeFS, found (and built) on first use.
     const FileSys::VirtualFile& LooseRomFS();
 
@@ -71,6 +75,7 @@ private:
     std::string name;
     std::optional<FileSys::NACP> control; ///< control.nacp next to the dump, if it has one
     std::string romfs_version;            ///< "1.8.0" from the RomFS's Product.180 tables, if any
+    bool romfs_version_pending{};
     u64 title_id{};
     bool override_update;
 

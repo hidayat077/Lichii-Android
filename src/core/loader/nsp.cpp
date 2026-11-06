@@ -4,9 +4,15 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/string_util.h"
 #include "core/core.h"
 #include "core/file_sys/common_funcs.h"
 #include "core/file_sys/content_archive.h"
@@ -24,6 +30,51 @@
 
 namespace Loader {
 
+namespace {
+
+std::string PackageStem(const FileSys::VirtualFile& package) {
+    if (package == nullptr) {
+        return {};
+    }
+    const std::string filename = package->GetName();
+    const auto dot = filename.find_last_of('.');
+    return dot == std::string::npos ? filename : filename.substr(0, dot);
+}
+
+FileSys::VirtualFile FindPackageSidecar(const FileSys::VirtualFile& package,
+                                        std::span<const std::string_view> names,
+                                        std::span<const std::string_view> extensions) {
+    if (package == nullptr) {
+        return nullptr;
+    }
+
+    const auto parent = package->GetContainingDirectory();
+    if (parent == nullptr) {
+        return nullptr;
+    }
+
+    const std::string stem = PackageStem(package);
+    for (const auto ext : extensions) {
+        if (auto match = parent->GetFile(stem + "." + std::string(ext))) {
+            return match;
+        }
+    }
+    for (const auto name : names) {
+        if (auto match = parent->GetFile(name)) {
+            return match;
+        }
+    }
+
+    const auto files = parent->GetFiles();
+    const auto iter = std::find_if(files.begin(), files.end(), [&](const FileSys::VirtualFile& candidate) {
+        const auto ext = Common::ToLower(candidate->GetExtension());
+        return std::find(extensions.begin(), extensions.end(), ext) != extensions.end();
+    });
+    return iter == files.end() ? nullptr : *iter;
+}
+
+} // namespace
+
 AppLoader_NSP::AppLoader_NSP(FileSys::VirtualFile file_,
                              const Service::FileSystem::FileSystemController& fsc,
                              const FileSys::ContentProvider& content_provider, u64 program_id,
@@ -35,7 +86,8 @@ AppLoader_NSP::AppLoader_NSP(FileSys::VirtualFile file_,
     }
 
     if (nsp->IsExtractedType()) {
-        secondary_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(nsp->GetExeFS(), false);
+        secondary_loader =
+            std::make_unique<AppLoader_DeconstructedRomDirectory>(nsp->GetExeFS(), false, true);
     } else {
         const auto control_nca =
             nsp->GetNCA(FileSys::GetBaseTitleID(nsp->GetProgramTitleID()), FileSys::ContentRecordType::Control);
@@ -137,7 +189,7 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
 
     if (nsp->IsExtractedType()) {
         system.GetFileSystemController().RegisterProcess(
-            process.GetProcessId(), {},
+            process.GetProcessId(), title_id,
             std::make_shared<FileSys::RomFSFactory>(*this, system.GetContentProvider(),
                                                     system.GetFileSystemController()));
     }
@@ -189,7 +241,15 @@ ResultStatus AppLoader_NSP::VerifyIntegrity(std::function<bool(size_t, size_t)> 
 }
 
 ResultStatus AppLoader_NSP::ReadRomFS(FileSys::VirtualFile& out_file) {
-    return secondary_loader->ReadRomFS(out_file);
+    const auto res = secondary_loader->ReadRomFS(out_file);
+    if (res == ResultStatus::Success) {
+        return ResultStatus::Success;
+    }
+    if (nsp->IsExtractedType() && nsp->GetRomFS() != nullptr) {
+        out_file = nsp->GetRomFS();
+        return ResultStatus::Success;
+    }
+    return res;
 }
 
 ResultStatus AppLoader_NSP::ReadUpdateRaw(FileSys::VirtualFile& out_file) {
@@ -227,33 +287,83 @@ ResultStatus AppLoader_NSP::ReadProgramIds(std::vector<u64>& out_program_ids) {
 }
 
 ResultStatus AppLoader_NSP::ReadIcon(std::vector<u8>& buffer) {
-    if (icon_file == nullptr) {
-        return ResultStatus::ErrorNoControl;
+    if (icon_file != nullptr) {
+        buffer = icon_file->ReadAllBytes();
+        return ResultStatus::Success;
     }
-
-    buffer = icon_file->ReadAllBytes();
-    return ResultStatus::Success;
+    if (secondary_loader != nullptr &&
+        secondary_loader->ReadIcon(buffer) == ResultStatus::Success) {
+        return ResultStatus::Success;
+    }
+    static constexpr std::array<std::string_view, 5> icon_names{
+        "icon_AmericanEnglish.dat", "icon.jpg", "icon.png", "icon.bmp", "icon.jpeg"};
+    static constexpr std::array<std::string_view, 4> icon_exts{"jpg", "png", "bmp", "jpeg"};
+    if (const auto sidecar = FindPackageSidecar(file, icon_names, icon_exts)) {
+        buffer = sidecar->ReadAllBytes();
+        return ResultStatus::Success;
+    }
+    return ResultStatus::ErrorNoControl;
 }
 
 ResultStatus AppLoader_NSP::ReadTitle(std::string& title) {
-    if (nacp_file == nullptr) {
-        return ResultStatus::ErrorNoControl;
+    if (nacp_file != nullptr) {
+        title = nacp_file->GetApplicationName();
+        return ResultStatus::Success;
     }
-
-    title = nacp_file->GetApplicationName();
-    return ResultStatus::Success;
+    if (secondary_loader != nullptr &&
+        secondary_loader->ReadTitle(title) == ResultStatus::Success && !title.empty()) {
+        return ResultStatus::Success;
+    }
+    FileSys::NACP nacp{};
+    if (ReadControlData(nacp) == ResultStatus::Success) {
+        title = nacp.GetApplicationName();
+        if (!title.empty()) {
+            return ResultStatus::Success;
+        }
+    }
+    if (nsp->IsExtractedType()) {
+        title = PackageStem(file);
+        if (!title.empty()) {
+            return ResultStatus::Success;
+        }
+    }
+    return ResultStatus::ErrorNoControl;
 }
 
 ResultStatus AppLoader_NSP::ReadControlData(FileSys::NACP& nacp) {
-    if (nacp_file == nullptr) {
-        return ResultStatus::ErrorNoControl;
+    if (nacp_file != nullptr) {
+        nacp = *nacp_file;
+        return ResultStatus::Success;
     }
+    if (secondary_loader != nullptr &&
+        secondary_loader->ReadControlData(nacp) == ResultStatus::Success) {
+        return ResultStatus::Success;
+    }
+    static constexpr std::array<std::string_view, 1> nacp_names{"control.nacp"};
+    static constexpr std::array<std::string_view, 1> nacp_exts{"nacp"};
+    if (const auto sidecar = FindPackageSidecar(file, nacp_names, nacp_exts)) {
+        nacp = FileSys::NACP{sidecar};
+        return ResultStatus::Success;
+    }
+    return ResultStatus::ErrorNoControl;
+}
 
-    nacp = *nacp_file;
-    return ResultStatus::Success;
+ResultStatus AppLoader_NSP::ReadDisplayVersion(std::string& version) {
+    if (nacp_file != nullptr && !nacp_file->GetVersionString().empty()) {
+        version = nacp_file->GetVersionString();
+        return ResultStatus::Success;
+    }
+    if (secondary_loader != nullptr &&
+        secondary_loader->ReadDisplayVersion(version) == ResultStatus::Success) {
+        return ResultStatus::Success;
+    }
+    return AppLoader::ReadDisplayVersion(version);
 }
 
 ResultStatus AppLoader_NSP::ReadManualRomFS(FileSys::VirtualFile& out_file) {
+    if (nsp->IsExtractedType()) {
+        return ResultStatus::ErrorNoRomFS;
+    }
     const auto nca =
         nsp->GetNCA(nsp->GetProgramTitleID(), FileSys::ContentRecordType::HtmlDocument);
     if (nsp->GetStatus() != ResultStatus::Success || nca == nullptr) {

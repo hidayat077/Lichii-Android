@@ -286,7 +286,26 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     : AppLoader(std::move(file_))
     , override_update(override_update_)
 {
-    const auto file_dir = file->GetContainingDirectory();
+    ReadDumpMetadata(file->GetContainingDirectory());
+}
+
+AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
+    FileSys::VirtualDir directory, bool override_update_, bool read_dump_metadata)
+    : AppLoader(directory->GetFile("main"))
+    , dir(std::move(directory))
+    , override_update(override_update_)
+{
+    romfs_exefs_dir = dir;
+    if (read_dump_metadata) {
+        ReadDumpMetadata(dir);
+    }
+}
+
+void AppLoader_DeconstructedRomDirectory::ReadDumpMetadata(const FileSys::VirtualDir& file_dir) {
+    if (file_dir == nullptr) {
+        return;
+    }
+
     const auto sidecar_dirs = FindSidecarDirs(file_dir);
 
     // Title ID
@@ -351,18 +370,7 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
     }
 
     romfs_exefs_dir = file_dir;
-    if (const auto title_dir = file_dir->GetParentDirectory()) {
-        romfs_version = RomFSProductVersion(FindLooseRomFSDirectory(title_dir));
-    }
-}
-
-AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
-    FileSys::VirtualDir directory, bool override_update_)
-    : AppLoader(directory->GetFile("main"))
-    , dir(std::move(directory))
-    , override_update(override_update_)
-{
-    romfs_exefs_dir = dir;
+    romfs_version_pending = true;
 }
 
 // Loaders made only for metadata (the game list, title lookups) never need the RomFS, and several
@@ -584,6 +592,14 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadDisplayVersion(std::string
     if (control && !control->GetVersionString().empty()) {
         version = control->GetVersionString();
         return ResultStatus::Success;
+    }
+    if (romfs_version_pending) {
+        romfs_version_pending = false;
+        if (romfs_exefs_dir != nullptr) {
+            if (const auto title_dir = romfs_exefs_dir->GetParentDirectory()) {
+                romfs_version = RomFSProductVersion(FindLooseRomFSDirectory(title_dir));
+            }
+        }
     }
     if (!romfs_version.empty()) {
         version = romfs_version;
