@@ -11,7 +11,7 @@ This is a personal fork. These notes take priority over the sections below where
 - No emulator, game files or debug server are available on this machine.
 - Never run `git push`, create pull requests, or merge upstream without explicit approval. Commit only on a feature branch created from `nx2`.
 - Documentation-only commits end with `[skip ci]`.
-Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
+- Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
 ## Game bug reports
 
