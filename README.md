@@ -10,60 +10,48 @@
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
 
-# Lichii for Android
+# Lichii for Android (Snapdragon 870 / Adreno 650 test fork)
 
-An Android port of the [Lichii](https://github.com/zortos293/Eglantine) Nintendo Switch / Switch 2 emulator, maintained by [pavelgajdo](https://github.com/pavelgajdo). It focuses on getting Switch 2 games running on Android phones, starting with Samsung's Exynos phones and their AMD-based Xclipse GPUs.
+A personal fork of [pavelgajdo/Lichii-Android](https://github.com/pavelgajdo/Lichii-Android), maintained by [hidayat077](https://github.com/hidayat077). The original project is an Android port of the [Lichii](https://github.com/zortos293/Eglantine) Nintendo Switch / Switch 2 emulator. It focuses on getting Switch 2 games running on Android phones, starting with Samsung's Exynos phones and their AMD-based Xclipse GPUs.
 
-This is an independent, experimental fork. It is not affiliated with Nintendo or with the upstream projects it builds on.
+This fork is used to experiment with small improvements and to check how the project behaves on a Qualcomm Snapdragon 870 phone (Adreno 650 GPU).
+
+This is an independent, experimental fork. It is not affiliated with Nintendo, with the original Lichii-Android maintainer, or with the upstream projects it builds on.
+
+## Status of this fork
+
+- **No functional changes yet.** The code is currently identical to upstream, apart from documentation and CI-related housekeeping.
+- **Not tested on Snapdragon 870 yet.** Nothing in this README claims that Switch 2 games run on this hardware. Treat every Snapdragon-related note below as an expectation or a starting point, not a result.
+- Changes are developed on separate branches and checked by the GitHub Actions build before being merged into this fork's `nx2` branch.
 
 ## Download
 
-- **Releases:** [github.com/pavelgajdo/Lichii/releases](https://github.com/pavelgajdo/Lichii/releases). Download the `.apk` from the latest `android-*` release and install it on your phone. You may need to allow installs from your browser or file manager.
-- **Test builds:** the `android-latest` pre-release is rebuilt automatically from every change on `nx2`. It has the newest fixes and the newest bugs.
+- **This fork's releases:** [github.com/hidayat077/Lichii-Android/releases](https://github.com/hidayat077/Lichii-Android/releases), if a release has been published by CI.
+- **Build artifacts:** every CI run uploads the APK as an artifact on its run page under the **Actions** tab. GitHub provides artifacts as a `.zip` file, so extract it to get the `.apk`.
+- **Upstream releases:** [github.com/pavelgajdo/Lichii/releases](https://github.com/pavelgajdo/Lichii/releases), the original author's builds.
 
-Requirements: an arm64 phone with Android 13 or newer and Vulkan 1.3. Games, keys and firmware are not included. Only use games and system files you have legally obtained.
+You may need to allow installs from your browser or file manager before installing an APK. Only install APKs from sources you trust.
 
-## Tested on
+## Requirements
 
-| | |
-|---|---|
-| Phone | Samsung Galaxy S26 (SM-S942B) |
-| SoC | Exynos 2600 |
-| GPU | Samsung Xclipse 960 (AMD RDNA3, GFX11) |
-| RAM | 12 GB |
-| OS | Android 17 (One UI) |
-| GPU driver | Custom Mesa RADV build for Xclipse ("RADV Xclipse", Mesa 27.0-devel), installed through the app's GPU driver manager |
+An arm64 phone with Android 13 or newer and Vulkan 1.3. Games, keys and firmware are not included. Only use games and system files you have legally obtained.
 
-Samsung's own driver on the S26 is also RADV-based and works, but on this phone it measured about 1.8× slower on the same scene than the custom RADV build.
+### Snapdragon 870 (Adreno 650) notes
 
-Other phones may work, but this is the only device the fork is tested on so far.
-
-> 📺 **Game Testing & Video Footage:** Check out gameplay performance tests and video showcases on the [Exynos Gaming YouTube Channel](https://www.youtube.com/@ExynosGaming-t7k).
+- The Snapdragon 870 is a 64-bit chip, so the arm64 requirement is met.
+- Adreno 650's official specification lists Vulkan 1.1. Whether a given phone's stock driver reports Vulkan 1.3 depends on the manufacturer's driver updates. Check your own device before expecting this app to work.
+- The open-source Mesa Turnip driver supports Vulkan 1.3 on Adreno 600-series GPUs, so a custom Turnip driver may close the gap. Whether and how it can be installed through this app's GPU driver manager has **not** been verified in this fork.
+- Android version and device-specific behavior (for example Realme UI background restrictions) can also affect results.
 
 ## Game status
 
-| Game | Status |
-|---|---|
-| The Legend of Zelda: Ocarina of Time (Switch 2) | Boots. The title screen and the pre-rendered intro movies run at 60 FPS. **It currently hangs while loading the first gameplay scene after the intro** (being worked on). |
-
-Only results tested on the phone above are listed here.
-
-### What's different from upstream
-
-- AV1 movies are decoded with Android's hardware decoder (MediaCodec).
-- Ocarina of Time's movies skip the game's movie-enhancement neural network (which needs NVIDIA tensor cores), so they play at full speed instead of about 8 FPS.
-- Emulated tensor-core math (HMMA) is about twice as fast on RADV.
-- `EDEN_*` diagnostic switches can be set on Android with an `env.txt` file (see below).
-
-## Recommended settings
-
-- **System:** Handheld mode.
-- **CPU:** NCE backend.
-- **Graphics:** 1× resolution. Install a custom RADV driver if your phone has an Xclipse GPU.
+No games have been tested on Snapdragon 870 in this fork yet.
 
 ## Reporting problems
 
-[Open an issue](https://github.com/pavelgajdo/Lichii/issues) with:
+For problems in this fork's own changes, open an issue at [github.com/hidayat077/Lichii-Android/issues](https://github.com/hidayat077/Lichii-Android/issues) (issues must be enabled in the repository settings). For problems in the emulator itself, upstream's tracker is [github.com/pavelgajdo/Lichii/issues](https://github.com/pavelgajdo/Lichii/issues).
+
+Include:
 
 - your phone model, Android version and GPU driver;
 - the game and what happened (screenshots help);
@@ -77,17 +65,33 @@ Android can't pass environment variables to an app, so Lichii reads them from `A
 
 ## Building
 
+This fork is normally built by GitHub Actions rather than on a local machine. The workflow is [.github/workflows/android.yml](.github/workflows/android.yml) and runs on every push. A first build on a fresh fork took about 22 minutes in testing.
+
+To build locally instead:
+
 ```bash
 cd src/android
 ./gradlew assembleMainlineRelWithDebInfo
 ```
 
-You need the Android SDK, NDK 28.2 and CMake 3.22. The APK is written to `src/android/app/build/outputs/apk/mainline/relWithDebInfo/`. CI builds every push (see [.github/workflows/android.yml](.github/workflows/android.yml)). Pushing a tag named `android-<version>` publishes a release with the APK.
+You need the Android SDK, NDK 28.2 and CMake 3.22. The APK is written to `src/android/app/build/outputs/apk/mainline/relWithDebInfo/`. Pushing a tag named `android-<version>` publishes a release with the APK.
 
 More documentation, inherited from upstream: [build guide](docs/Build.md), [coding guidelines](docs/Coding.md).
+
+### Setting up CI on your own fork
+
+1. GitHub disables workflows on new forks. Open the **Actions** tab and enable them.
+2. Under **Settings → Actions → General → Workflow permissions**, choose **Read and write permissions** so the release step can publish.
+3. Documentation-only commits can skip the build by adding `[skip ci]` to the commit message.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/Coding.md](docs/Coding.md) before changing code. Keep each change small and focused, and do one improvement per branch. A green CI build shows that the code compiles. It does not prove that the change works correctly on a device, so describe honestly what was and was not tested.
 
 ## Credits and license
 
 Lichii for Android builds on [Lichii](https://github.com/zortos293/Eglantine) by Zortos and on Eglantine, Eden, yuzu and Sudachi, and their contributors, including Eglantine's original developer Camille LaVey. Lichii artwork by YOB (yobslab). Original copyright notices and third-party licenses are retained.
+
+This fork is based on [pavelgajdo/Lichii-Android](https://github.com/pavelgajdo/Lichii-Android).
 
 See [LICENSE.txt](LICENSE.txt) and the source files for the applicable license terms.
