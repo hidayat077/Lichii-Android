@@ -277,7 +277,9 @@ private:
         std::filesystem::create_directories(cache->spill_dir, ec);
 
         std::filesystem::path cache_path;
-        if (cache->persistent_spills) {
+        const bool has_sha256 =
+            std::any_of(sha256.begin(), sha256.end(), [](u8 b) { return b != 0; });
+        if (cache->persistent_spills && has_sha256) {
             static constexpr char HexDigits[] = "0123456789abcdef";
             std::string hex_hash;
             hex_hash.reserve(sha256.size() * 2);
@@ -885,7 +887,7 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
         } else if (node.codec == CodecRaw) {
             content = ReadExtentRaw(node);
         } else {
-            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
+            NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, {}, node.name,
                             cache, i);
             content = view.ReadAllBytes();
         }
