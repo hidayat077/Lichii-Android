@@ -1031,7 +1031,7 @@ void HostMemory::HintCold(size_t physical_offset, size_t length,
     }
 }
 
-void HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) {
+void HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) const {
     if (length == 0 || backing_base == nullptr || physical_offset >= backing_size) {
         return;
     }

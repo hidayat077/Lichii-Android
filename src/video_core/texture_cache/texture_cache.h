@@ -54,7 +54,7 @@ using namespace Common::Literals;
 // A host image that keeps only mip levels >= host_level_offset (TrimmedLevels) takes the plain
 // upload copies of those levels, renumbered so host level 0 is guest level host_level_offset.
 template <typename Copies>
-void TrimHostLevels(u32 host_level_offset, Copies& copies) {
+inline void TrimHostLevels(u32 host_level_offset, Copies& copies) {
     if (host_level_offset == 0) {
         return;
     }
@@ -74,7 +74,7 @@ void TrimHostLevels(u32 host_level_offset, Copies& copies) {
 // levels a side doesn't keep dropped. Copying a level a host image lacks is invalid Vulkan, and
 // Turnip crashed on it once reduce_texture_resolution trimmed most compressed textures.
 template <typename Copies>
-void TrimImageCopies(u32 dst_level_offset, u32 src_level_offset, Copies& copies) {
+inline void TrimImageCopies(u32 dst_level_offset, u32 src_level_offset, Copies& copies) {
     if (dst_level_offset == 0 && src_level_offset == 0) {
         return;
     }
