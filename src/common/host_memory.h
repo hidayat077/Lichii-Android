@@ -57,6 +57,10 @@ public:
     /// last full clear) is skipped: clearing it only made the host give every page real memory.
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /// Gives the OS back the RAM of whole host pages in [physical_offset, physical_offset + length)
+    /// of the backing: they read as zeros until written again, without committing untouched pages.
+    void ReleaseBackingRegion(size_t physical_offset, size_t length);
+
     /// Memory written once and read again rarely: its pages leave the working set (backing and,
     /// when given, its view at virtual_offset), so the OS compresses or pages them out first when
     /// it needs RAM. The contents stay; using the pages brings them back.

@@ -16,10 +16,12 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/memory_detect.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
@@ -110,7 +112,12 @@ void BufferCache<P>::TickFrame() {
         return;
     }
     runtime.TickFrame(slot_buffers);
-    if (frame_tick % 600 == 0 && !uploaded_buffer_ranges.empty()) {
+#ifdef __ANDROID__
+    constexpr u64 cold_hint_period = 180;
+#else
+    constexpr u64 cold_hint_period = 600;
+#endif
+    if (frame_tick % cold_hint_period == 0 && !uploaded_buffer_ranges.empty()) {
         for (const auto& [address, size] : uploaded_buffer_ranges) {
             device_memory.HintCold(address, size);
         }
@@ -153,8 +160,17 @@ void BufferCache<P>::TickFrame() {
         // downloading the GPU-written ones, ~5% of the GPU thread) that were recreated later.
         // Collect when the buffers themselves are large. At 1 GiB it held geometry of scenes
         // long gone: title 1's title screen grew to ~0.9 GB of buffers in ten minutes.
-        if (buffer_bytes >= 512_MiB) {
-            RunGarbageCollector(buffer_bytes >= 1_GiB);
+#ifdef __ANDROID__
+        static const bool low_ram_device =
+            Common::GetMemInfo().TotalPhysicalMemory < (u64{10} << 30);
+        const u64 expected_buf_bytes = low_ram_device ? 256_MiB : 512_MiB;
+        const u64 critical_buf_bytes = low_ram_device ? 512_MiB : 1_GiB;
+#else
+        constexpr u64 expected_buf_bytes = 512_MiB;
+        constexpr u64 critical_buf_bytes = 1_GiB;
+#endif
+        if (buffer_bytes >= expected_buf_bytes) {
+            RunGarbageCollector(buffer_bytes >= critical_buf_bytes);
         }
     } else if (total_used_memory >= minimum_memory) {
         RunGarbageCollector(total_used_memory >= critical_memory);
@@ -190,7 +206,8 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // above, so they aren't overwritten).
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && VideoCommon::GpuSplit::OwnsScheduler() &&
+        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
         static const int forced = [] {
@@ -665,7 +682,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode());
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsDlssDispatch());
 }
 
 template <class P>
@@ -1585,10 +1602,14 @@ void BufferCache<P>::UpdateIndexBuffer() {
         auto inline_index_size = static_cast<u32>(draw_state.inline_index_draw_indexes.size());
         u32 buffer_size = Common::AlignUp(inline_index_size, CACHING_PAGESIZE);
         if (inline_buffer_id == NULL_BUFFER_ID) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Creating inline index buffer of {:#x} bytes", buffer_size);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            slot_buffers.erase(inline_buffer_id);
+            LOG_INFO(HW_GPU, "Growing inline index buffer to {:#x} bytes", buffer_size);
+            // Erasing the slot directly left its page table entries and LRU item behind, so a
+            // later CreateBuffer could reuse the slot and join the new buffer with itself.
+            DeleteBuffer(inline_buffer_id, true);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -1638,9 +1659,16 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
-    const u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
+    u64 native_size = native ? maxwell3d->regs.NativeVertexStreamSize(index) : 0;
     if (native && array.enable != 0 && native_size > (std::numeric_limits<u32>::max)()) {
-        throw std::runtime_error("Native vertex stream exceeds supported 32-bit buffer size");
+        // A misread or stale size: bounded by what's mapped below instead. Thrown on the GPU
+        // thread, it aborted Mario Kart World as it booted.
+        static std::atomic<u32> reports{};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_WARNING(HW_GPU, "Native vertex stream {} size {:#x} exceeds 32 bits, clamped", index,
+                        native_size);
+        }
+        native_size = (std::numeric_limits<u32>::max)();
     }
     const GPUVAddr gpu_addr_end = native ? gpu_addr_begin + native_size : limit.Address() + 1;
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
@@ -2105,6 +2133,18 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         if (!overlap_id) {
             continue;
         }
+        if (!slot_buffers.contains(overlap_id)) [[unlikely]] {
+            // A deleted buffer is still in the page table. Joining it would delete whichever
+            // buffer reuses the slot next, possibly the one being created here.
+            static u32 stale_logs = 0;
+            if (stale_logs < 16) {
+                ++stale_logs;
+                LOG_ERROR(HW_GPU, "Stale buffer page: device_addr={:#x} buffer_id={}",
+                          device_addr, overlap_id.index);
+            }
+            page_table[device_addr >> CACHING_PAGEBITS] = BufferId{};
+            continue;
+        }
         Buffer& overlap = slot_buffers[overlap_id];
         if (overlap.IsPicked()) {
             continue;
@@ -2210,7 +2250,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     } else {
         buffer_bytes -= Common::AlignUp(size, 1024);
         total_used_memory -= Common::AlignUp(size, 1024);
-        lru_cache.Free(buffer.getLRUID());
+        // Only a registered buffer has an LRU item (freeing SIZE_MAX crashed in Free).
+        if (buffer.getLRUID() != SIZE_MAX) {
+            lru_cache.Free(buffer.getLRUID());
+            buffer.setLRUID(SIZE_MAX);
+        }
     }
     const DAddr device_addr_begin = buffer.CpuAddr();
     const DAddr device_addr_end = device_addr_begin + size;
@@ -2219,7 +2263,8 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
     for (u64 page = page_begin; page != page_end; ++page) {
         if constexpr (insert) {
             page_table[page] = buffer_id;
-        } else {
+        } else if (page_table[page] == buffer_id) {
+            // Only its own entries: another buffer's would go stale.
             page_table[page] = BufferId{};
         }
     }
@@ -2227,7 +2272,7 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
 
 template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
-    if (buffer_id != NULL_BUFFER_ID) {
+    if (buffer_id != NULL_BUFFER_ID && buffer.getLRUID() != SIZE_MAX) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
     }
 }
@@ -2460,10 +2505,21 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
+    const DAddr buffer_addr = buffer.CpuAddr();
+    const DAddr buffer_end = buffer_addr + buffer.SizeBytes();
+    const DAddr range_begin = (std::max)(device_addr, buffer_addr);
+    const DAddr range_end = (std::min)(device_addr + size, buffer_end);
+    if (range_begin >= range_end) {
+        return;
+    }
     memory_tracker.ForEachDownloadRangeAndClear(
-        device_addr, size, [&](u64 device_addr_out, u64 range_size) {
-            const DAddr buffer_addr = buffer.CpuAddr();
+        range_begin, range_end - range_begin, [&](u64 device_addr_out, u64 range_size) {
             const auto add_download = [&](DAddr start, DAddr end) {
+                start = (std::max)(start, buffer_addr);
+                end = (std::min)(end, buffer_end);
+                if (start >= end) {
+                    return;
+                }
                 const u64 new_offset = start - buffer_addr;
                 const u64 new_size = end - start;
                 copies.push_back(BufferCopy{
@@ -2526,6 +2582,10 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    if (buffer_id == inline_buffer_id) {
+        // The garbage collector can delete the inline index buffer; recreate it on next use.
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
@@ -2614,6 +2674,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // A native (Switch 2) compute program's pointer is bare: the word after it is another
         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+        // Only DLSS passes size from the mapping: doing it for every native dispatch binds up to
+        // 8 MiB per buffer and slows Hyrule Warriors' fights to a few fps, then hangs them.
         if (native_pointer) {
             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }

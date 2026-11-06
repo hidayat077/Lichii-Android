@@ -227,6 +227,10 @@ void EmulationSession::ConfigureFilesystemProvider(const std::string& filepath) 
         return;
     }
 
+    if (Loader::IdentifyFile(file) != Loader::FileType::NCA) {
+        return;
+    }
+
     auto loader = Loader::GetLoader(m_system, file);
     if (!loader) {
         return;

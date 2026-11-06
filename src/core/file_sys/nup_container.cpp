@@ -159,7 +159,7 @@ public:
         : backing(std::move(backing_)), extent_offset(extent_offset_), extent_size(extent_size_),
           uncompressed_size(uncompressed_size_), sha256(sha256_), name(std::move(name_)),
           cache(std::move(cache_)), cache_index(cache_index_),
-          cache_enabled(uncompressed_size <= cache->cap / 2) {}
+          cache_enabled(uncompressed_size <= cache->spill_threshold) {}
 
     std::string GetName() const override {
         return name;
@@ -362,15 +362,42 @@ private:
         if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
             return {};
         }
-        const auto compressed = backing->ReadBytes(static_cast<std::size_t>(extent_size),
-                                                   static_cast<std::size_t>(extent_offset));
-        if (compressed.size() != extent_size) {
+        std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
+        std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> dctx{ZSTD_createDCtx(),
+                                                                  &ZSTD_freeDCtx};
+        if (!dctx) {
             return {};
         }
-        std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
-        const std::size_t result =
-            ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());
-        if (ZSTD_isError(result) || result != out.size()) {
+        std::vector<u8> in_buffer(
+            static_cast<std::size_t>(std::min<u64>(ZSTD_DStreamInSize(), extent_size)));
+        u64 read = 0;
+        std::size_t written = 0;
+        bool frame_done = false;
+        while (!frame_done && read < extent_size) {
+            const auto chunk =
+                static_cast<std::size_t>(std::min<u64>(in_buffer.size(), extent_size - read));
+            if (backing->Read(in_buffer.data(), chunk,
+                              static_cast<std::size_t>(extent_offset + read)) != chunk) {
+                return {};
+            }
+            read += chunk;
+            ZSTD_inBuffer input{in_buffer.data(), chunk, 0};
+            while (!frame_done && input.pos < input.size) {
+                ZSTD_outBuffer output{out.data() + written, out.size() - written, 0};
+                const std::size_t result = ZSTD_decompressStream(dctx.get(), &output, &input);
+                if (ZSTD_isError(result)) {
+                    LOG_ERROR(Loader, "NUP zstd decompression failed for {}", name);
+                    return {};
+                }
+                written += output.pos;
+                frame_done = result == 0;
+                if (!frame_done && input.pos < input.size && output.pos == 0) {
+                    LOG_ERROR(Loader, "NUP zstd decompression overflowed for {}", name);
+                    return {};
+                }
+            }
+        }
+        if (!frame_done || written != out.size()) {
             LOG_ERROR(Loader, "NUP zstd decompression failed for {}", name);
             return {};
         }
@@ -411,6 +438,9 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
                            std::filesystem::path spill_dir_)
     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
     cache->cap = memory_cache_cap;
+    cache->spill_threshold = memory_cache_cap == NupDecompressCache::DefaultCap
+                                 ? NupDecompressCache::DefaultSpillThreshold
+                                 : memory_cache_cap / 2;
     cache->persistent_spills = spill_dir_.empty();
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"

@@ -24,6 +24,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
@@ -1727,7 +1728,39 @@ void Device::ReleaseCustomBorderColorSamplers(size_t count) const {
     custom_border_color_samplers_used.fetch_sub(count, std::memory_order_relaxed);
 }
 
+#ifdef __ANDROID__
+namespace {
+[[nodiscard]] u64 AndroidIntegratedMemoryBudget() {
+    const u64 total_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    if (total_ram < (u64{10} << 30)) {
+        return 1792_MiB;
+    }
+    if (total_ram < (u64{14} << 30)) {
+        return 2560_MiB;
+    }
+    return (std::max<u64>)(total_ram / 5, 4_GiB);
+}
+} // namespace
+#endif
+
 u64 Device::GetDeviceMemoryUsage() const {
+    // Without VK_EXT_memory_budget (Qualcomm's driver), what VMA's allocations use. The caches'
+    // own estimate counted sparse and unbacked images at their full size: Mario Kart World
+    // "used" 8.5 GB with 4.7 GB allocated, and evicted textures nonstop until the phone ran out of
+    // memory. Android only (CanReportMemoryUsage).
+#ifdef __ANDROID__
+    if (!extensions.memory_budget) {
+        u64 used{};
+        if (allocator != nullptr) {
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+            vmaGetHeapBudgets(allocator, heap_budgets.data());
+            for (const size_t heap : valid_heap_memory) {
+                used += heap_budgets[heap].statistics.allocationBytes;
+            }
+        }
+        return used;
+    }
+#endif
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
@@ -1753,9 +1786,16 @@ u64 Device::GetDeviceMemorySlack() const {
 }
 
 u64 Device::GetDeviceMemoryBudget() const {
+#ifdef __ANDROID__
+    const u64 integrated_budget = AndroidIntegratedMemoryBudget();
+    if (!extensions.memory_budget) {
+        return is_integrated ? integrated_budget : 0;
+    }
+#else
     if (!extensions.memory_budget) {
         return 0;
     }
+#endif
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
     physical.GetMemoryProperties(&budget);
@@ -1781,7 +1821,11 @@ u64 Device::GetDeviceMemoryBudget() const {
         // budget): following it let the texture cache fill that much RAM before collecting, and
         // kept ASTC uncompressed. Its budget is at most the share CollectPhysicalMemoryInfo
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
+#ifdef __ANDROID__
+        result = (std::min)(result, integrated_budget);
+#else
         result = (std::min)(result, device_access_memory);
+#endif
     }
     return result;
 }
@@ -1839,6 +1883,9 @@ void Device::CollectPhysicalMemoryInfo() {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
+#ifdef __ANDROID__
+        device_access_memory = (std::min)(device_access_memory, AndroidIntegratedMemoryBudget());
+#endif
     } else {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;

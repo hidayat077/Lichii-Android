@@ -35,7 +35,12 @@ struct NupSpillFile {
 
 /// LRU over decompressed zstd extents, shared by the files of one container.
 struct NupDecompressCache {
+#ifdef __ANDROID__
+    static constexpr std::size_t DefaultCap = 64 * 1024 * 1024;
+#else
     static constexpr std::size_t DefaultCap = 512 * 1024 * 1024;
+#endif
+    static constexpr std::size_t DefaultSpillThreshold = 256 * 1024 * 1024;
 
     using Entry = std::pair<std::size_t, std::vector<u8>>;
 
@@ -44,6 +49,7 @@ struct NupDecompressCache {
     std::unordered_map<std::size_t, std::list<Entry>::iterator> index;
     std::size_t bytes{};
     std::size_t cap{DefaultCap};
+    std::size_t spill_threshold{DefaultSpillThreshold};
     std::filesystem::path spill_dir;
     bool persistent_spills{};
     bool cleaned_stale_tmps{};
@@ -68,12 +74,19 @@ struct NupDecompressCache {
             index.erase(lru.back().first);
             lru.pop_back();
         }
-        if (bytes + data.size() > cap) {
+        if (bytes + data.size() > cap && (!lru.empty() || data.size() > spill_threshold)) {
             return;
         }
         bytes += data.size();
         lru.emplace_front(file_index, std::move(data));
         index.emplace(file_index, lru.begin());
+    }
+
+    void Clear() {
+        std::scoped_lock lock{mutex};
+        lru.clear();
+        index.clear();
+        bytes = 0;
     }
 
     std::shared_ptr<NupSpillFile> GetSpill(std::size_t file_index) {
@@ -170,6 +183,13 @@ public:
 
     std::size_t GetFileCount() const {
         return files.size();
+    }
+
+    /// Releases all in-memory decompressed extents (e.g. ExeFS NSOs after process creation).
+    void ClearMemoryCache() {
+        if (cache) {
+            cache->Clear();
+        }
     }
 
 private:

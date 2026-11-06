@@ -196,6 +196,7 @@ AppLoader::LoadResult AppLoader_NUP::Load(Kernel::KProcess& process, Core::Syste
     }
 
     const auto result = secondary_loader->Load(process, system);
+    nup->ClearMemoryCache();
     if (result.first != ResultStatus::Success) {
         return result;
     }

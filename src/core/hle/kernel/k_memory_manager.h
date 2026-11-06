@@ -297,6 +297,13 @@ private:
 
             size_t free_start = 0;
             size_t free_count = 0;
+            const auto free_run = [&] {
+                const KPhysicalAddress run = m_heap.GetAddress() + free_start * PageSize;
+                this->Free(run, free_count);
+                if (m_owner != nullptr && free_count >= 16) {
+                    m_owner->ReleaseFreedPages(run, free_count);
+                }
+            };
             while (index < end) {
                 ASSERT(m_page_reference_counts[index] > 0);
                 const RefCount ref_count = (--m_page_reference_counts[index]);
@@ -311,7 +318,7 @@ private:
                     }
                 } else {
                     if (free_count > 0) {
-                        this->Free(m_heap.GetAddress() + free_start * PageSize, free_count);
+                        free_run();
                         free_count = 0;
                     }
                 }
@@ -320,8 +327,12 @@ private:
             }
 
             if (free_count > 0) {
-                this->Free(m_heap.GetAddress() + free_start * PageSize, free_count);
+                free_run();
             }
+        }
+
+        constexpr void SetOwner(KMemoryManager* owner) {
+            m_owner = owner;
         }
 
     private:
@@ -331,6 +342,7 @@ private:
         std::vector<RefCount> m_page_reference_counts;
         KVirtualAddress m_management_region{};
         Pool m_pool{};
+        KMemoryManager* m_owner{};
         Impl* m_next{};
         Impl* m_prev{};
     };
@@ -338,6 +350,7 @@ private:
 private:
     void MarkUsed(KPhysicalAddress address, size_t num_pages);
     void MarkDirty(KPhysicalAddress address, size_t num_pages);
+    void ReleaseFreedPages(KPhysicalAddress address, size_t num_pages);
 
     Impl& GetManager(KPhysicalAddress address) {
         return m_managers[m_memory_layout.GetPhysicalLinearRegion(address).GetAttributes()];

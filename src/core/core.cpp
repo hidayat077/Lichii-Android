@@ -510,6 +510,15 @@ struct System::Impl {
         cpu_manager.Shutdown();
         debugger.reset();
         kernel.Shutdown();
+        // A Switch 2 run switched to the 12 GiB layout and touched gigabytes of device_memory.
+        // Without this, those pages stay committed until another game changes the layout.
+#ifdef __ANDROID__
+        device_memory.reset();
+#else
+        if (Settings::CurrentProgramIsSwitch2()) {
+            device_memory.reset();
+        }
+#endif
         stop_event = {};
         Network::RestartSocketOperations();
 

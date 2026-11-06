@@ -528,6 +528,10 @@ public:
                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
                          static_cast<off_t>(length)) == 0;
     }
+
+    size_t HostPageSize() const {
+        return host_page_size;
+    }
 #endif
 
     bool Init() {
@@ -992,25 +996,62 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 #endif
 }
 
+#if defined(__linux__) && !defined(MADV_PAGEOUT)
+#define MADV_PAGEOUT 21
+#endif
+
 void HostMemory::HintCold(size_t physical_offset, size_t length,
                           std::optional<size_t> virtual_offset) const {
     if (length == 0 || backing_base == nullptr) {
         return;
     }
-    const auto hint = [length](u8* address) {
+    const auto hint = [](u8* address, size_t size) {
+        const uintptr_t aligned_begin =
+            Common::AlignDown(reinterpret_cast<uintptr_t>(address), PageAlignment);
+        const uintptr_t aligned_end =
+            Common::AlignUp(reinterpret_cast<uintptr_t>(address) + size, PageAlignment);
+        if (aligned_end <= aligned_begin) {
+            return;
+        }
 #ifdef _WIN32
         // Unlocking pages that are not locked takes them out of the working set.
-        VirtualUnlock(address, length);
+        VirtualUnlock(reinterpret_cast<void*>(aligned_begin), aligned_end - aligned_begin);
 #elif defined(__linux__) && defined(MADV_PAGEOUT)
-        madvise(address, length, MADV_PAGEOUT);
+        madvise(reinterpret_cast<void*>(aligned_begin), aligned_end - aligned_begin, MADV_PAGEOUT);
 #else
-        static_cast<void>(address);
+        static_cast<void>(aligned_begin);
 #endif
     };
-    hint(backing_base + physical_offset);
+    hint(backing_base + physical_offset, length);
     if (virtual_offset && virtual_base != nullptr && *virtual_offset + length <= virtual_size) {
-        hint(virtual_base + *virtual_offset);
+        u8* const virt_addr = *virtual_offset >= reinterpret_cast<uintptr_t>(virtual_base)
+                                  ? reinterpret_cast<u8*>(*virtual_offset)
+                                  : virtual_base + *virtual_offset;
+        hint(virt_addr, length);
     }
+}
+
+void HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) {
+    if (length == 0 || backing_base == nullptr || physical_offset >= backing_size) {
+        return;
+    }
+    length = (std::min)(length, backing_size - physical_offset);
+#ifdef __linux__
+    const size_t host_page = impl ? impl->HostPageSize() : PageAlignment;
+    const size_t begin = Common::AlignUp(physical_offset, host_page);
+    const size_t end = Common::AlignDown(physical_offset + length, host_page);
+    if (end <= begin) {
+        return;
+    }
+    if (!impl || !impl->PunchHole(begin, end - begin)) {
+        madvise(backing_base + begin, end - begin, MADV_DONTNEED);
+    }
+    const size_t first_granule = Common::AlignUp(begin, size_t{1} << GranuleShift) >> GranuleShift;
+    const size_t end_granule = Common::AlignDown(end, size_t{1} << GranuleShift) >> GranuleShift;
+    for (size_t index = first_granule; index < end_granule && index < num_granules; ++index) {
+        granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+    }
+#endif
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {

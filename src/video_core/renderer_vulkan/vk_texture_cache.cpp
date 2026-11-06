@@ -22,6 +22,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
 #include "shader_recompiler/exception.h"
@@ -191,6 +192,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
            info.type != ImageType::Linear && Tegra::Nx2SparseUnwritten(gpu_addr, size);
 }
 
+[[nodiscard]] bool IsMobileGpu(const Device& device);
+
 // A large color array in a Switch 2 sparse region (title 1's terrain arrays: 13-26% of their
 // blocks written) gets memory by layer, as its layers are written: unbacked at first, then
 // Image::BindLayers. Only formats uploaded layer by layer: huge ASTC arrays (GPU decode) and
@@ -202,10 +205,13 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
     }
+    // ASTC a phone GPU samples as it is (Adreno) uploads layer by layer like other plain formats:
+    // without this, Mario Kart World's ASTC 8x8 terrain arrays stayed unbacked (black) on phones.
     const bool layer_uploads =
         IsHugeAstcArray(device, info) ||
-        (!IsPixelFormatASTC(info.format) &&
-         (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()));
+        (IsPixelFormatASTC(info.format)
+             ? device.IsOptimalAstcSupported() && IsMobileGpu(device)
+             : (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()));
     const u32 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
 }
@@ -282,9 +288,33 @@ enum class SparseTilesMode {
     }
 }
 
+// Phone and tablet GPUs: device memory is the system's RAM, shared with everything else.
+[[nodiscard]] bool IsMobileGpu(const Device& device) {
+    switch (device.GetDriverID()) {
+    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
+    case VK_DRIVER_ID_MESA_TURNIP:
+    case VK_DRIVER_ID_ARM_PROPRIETARY:
+    case VK_DRIVER_ID_MESA_PANVK:
+    case VK_DRIVER_ID_IMAGINATION_PROPRIETARY:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The most device memory one SparseLayers image binds: 768 MiB, 384 MiB on GPUs with less than
 // 7 GiB (title 1's BC6H arrays are 85 MB a layer).
 [[nodiscard]] VkDeviceSize SparseLayersCap(const Device& device) {
+    if (IsMobileGpu(device)) {
+        const u64 total_ram = Common::GetMemInfo().TotalPhysicalMemory;
+        if (total_ram >= (u64{16} << 30)) {
+            return VkDeviceSize{1536} << 20;
+        }
+        if (total_ram < (u64{10} << 30)) {
+            return VkDeviceSize{256} << 20;
+        }
+        return VkDeviceSize{512} << 20;
+    }
     return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (VkDeviceSize{384} << 20)
                                                            : (VkDeviceSize{768} << 20);
 }
@@ -360,10 +390,98 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 // over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
 // its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
 // coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
-[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+// Bytes of a 2D image's host copy from level `skip` on, for formats not decoded on the GPU.
+[[nodiscard]] u64 HostImageBytes(const Device& device, const ImageInfo& info, u32 skip) {
+    const bool decoded =
+        (IsPixelFormatASTC(info.format) && !device.IsOptimalAstcSupported()) ||
+        (VideoCore::Surface::IsPixelFormatBCn(info.format) && !device.IsOptimalBcnSupported());
+    const u32 block_width = decoded ? 1 : VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_height = decoded ? 1 : VideoCore::Surface::DefaultBlockHeight(info.format);
+    const u64 block_bytes = decoded ? 4 : BytesPerBlock(info.format);
+    u64 bytes = 0;
+    for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
+        const u32 width = (std::max)(info.size.width >> level, 1U);
+        const u32 height = (std::max)(info.size.height >> level, 1U);
+        bytes += u64{Common::DivCeil(width, block_width)} * Common::DivCeil(height, block_height) *
+                 block_bytes;
+    }
+    return bytes * static_cast<u64>(info.resources.layers);
+}
+
+// Most bytes a host image may span: past the sparse address space it cannot even be created
+// unbacked. The Qualcomm driver also refuses any allocation over 4 GiB, sparse ones included.
+[[nodiscard]] u64 MaxHostImageBytes(const Device& device) {
+    u64 limit = device.GetSparseAddressSpaceSize();
+    if (device.GetDriverID() == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) {
+        limit = (std::min)(limit, u64{4} << 30);
+    }
+    return limit;
+}
+
+// A large compressed texture keeps its levels from 1 on, a quarter of the memory. Compressed
+// formats are never render targets or storage images, so the GPU only samples them; copies by
+// guest level are kept off them (IsSafeGpuCopy, AccelerateDMA).
+[[nodiscard]] bool ReducesResolution(const ImageInfo& info) {
+    using VideoCore::Surface::IsPixelFormatASTC;
+    using VideoCore::Surface::IsPixelFormatBCn;
+#ifdef __ANDROID__
+    static const bool low_ram = Common::GetMemInfo().TotalPhysicalMemory < (u64{10} << 30);
+    static const bool force_full_res = [] {
+        const char* value = std::getenv("EDEN_NX2_FULL_RES_TEXTURES");
+        return value != nullptr && value[0] == '1';
+    }();
+    const bool enabled = !force_full_res && low_ram && Settings::CurrentProgramIsSwitch2();
+    const u32 min_dim = 512;
+#else
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_REDUCE_TEXTURE_RES");
+        return value != nullptr && value[0] == '1';
+    }();
+    const u32 min_dim = 1024;
+#endif
+    return enabled && info.type == ImageType::e2D && info.resources.levels >= 2 &&
+           info.num_samples == 1 && (std::min)(info.size.width, info.size.height) >= min_dim &&
+           (IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format));
+}
+
+// The host image within the host's limits: `info`, or its lower levels (level_offset > 0).
+[[nodiscard]] ImageInfo HostInfoWithinLimits(const Device& device, const ImageInfo& info,
+                                             u32& level_offset) {
     level_offset = 0;
-    if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
+    if (info.type != ImageType::e2D) {
         return info;
+    }
+    if (!WillUseAcceleratedAstcDecode(device, info)) {
+        // Too big for the host to create at all (Mario Kart World's 8192x8192x68 BC6H virtual
+        // texture is 6 GB, the Adreno limit 4 GB): keep its lower levels, as for ASTC below.
+        // On a phone, also no more than one sparse image may bind, so every layer gets memory.
+        const bool mobile = IsMobileGpu(device);
+        const u64 max_bytes = MaxHostImageBytes(device);
+        const u64 limit = mobile ? (std::min)(max_bytes == 0 ? ~u64{} : max_bytes,
+                                              u64{SparseLayersCap(device)})
+                                 : max_bytes;
+        const u64 target = mobile ? limit : limit / 2;
+        if (limit == 0 || HostImageBytes(device, info, 0) <= limit) {
+            return info;
+        }
+        while (level_offset + 1 < static_cast<u32>(info.resources.levels) &&
+               HostImageBytes(device, info, level_offset) > target) {
+            ++level_offset;
+        }
+        ImageInfo host = info;
+        host.size.width = (std::max)(info.size.width >> level_offset, 1U);
+        host.size.height = (std::max)(info.size.height >> level_offset, 1U);
+        host.resources.levels -= static_cast<s32>(level_offset);
+        static u32 logged{};
+        if (logged++ < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "{}x{}x{} image (format {}) is {} MiB, over the host's {} MiB; keeping mip "
+                        "levels {}+ ({}x{})",
+                        info.size.width, info.size.height, info.resources.layers,
+                        static_cast<u32>(info.format), HostImageBytes(device, info, 0) >> 20,
+                        limit >> 20, level_offset, host.size.width, host.size.height);
+        }
+        return host;
     }
     const auto decoded_bytes = [&](u32 skip) {
         u64 bytes = 0;
@@ -388,6 +506,17 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
     LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
                 info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
                 level_offset, host.size.width, host.size.height);
+    return host;
+}
+
+[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+    ImageInfo host = HostInfoWithinLimits(device, info, level_offset);
+    if (level_offset == 0 && ReducesResolution(info)) {
+        level_offset = 1;
+        host.size.width = (std::max)(info.size.width >> 1, 1U);
+        host.size.height = (std::max)(info.size.height >> 1, 1U);
+        host.resources.levels -= 1;
+    }
     return host;
 }
 
@@ -453,7 +582,8 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false, bool aliased = false) {
+                                  bool unbacked = false, bool aliased = false,
+                                  bool back_huge = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -486,7 +616,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
             return image;
         }
     }
-    return allocator.CreateImage(image_ci);
+    return allocator.CreateImage(image_ci, false, back_huge);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2783,6 +2913,10 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
 
 void TextureCacheRuntime::LogMemoryStatistics() const {
     Vulkan::LogMemoryStatistics(device);
+    LOG_INFO(Render_Vulkan, "Staging buffers: upload {} MiB, download {} MiB, device local {} MiB",
+             staging_buffer_pool.CachedBytes(MemoryUsage::Upload) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::Download) >> 20,
+             staging_buffer_pool.CachedBytes(MemoryUsage::DeviceLocal) >> 20);
 }
 
 bool TextureCacheRuntime::UseOpaqueAstcFormat() const {
@@ -2846,7 +2980,11 @@ void TextureCacheRuntime::TickFrame() {
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
     // Finished decode images wait for the next texture of their shape, up to this much memory.
+#ifdef __ANDROID__
+    static constexpr u64 MaxFreeTranscodeBytes = u64{32} << 20;
+#else
     static constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+#endif
     const auto decode_bytes = [](const PendingTranscode& t) {
         u64 bytes{};
         for (u32 level = 0; level < t.levels; ++level) {
@@ -2906,14 +3044,51 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
-        if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
+        // On a phone a large image can still be backed whole (it is RAM): when it fits one sparse
+        // image's share, rather than stay all zeros for want of sparse residency in its format.
+        const bool backable = IsMobileGpu(runtime_.device) &&
+                              HostImageBytes(runtime_.device, host_info, 0) <=
+                                  SparseLayersCap(runtime_.device);
+        const bool layered_sparse = UsesSparseLayers(runtime_.device, info, gpu_addr_);
+        if (layered_sparse && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
+        } else if (layered_sparse && !backable &&
+                   !IsUnwrittenSparse(runtime_.device, info, gpu_addr_)) {
+            // The driver's sparse block can't be bound by: back it as before SparseLayers (on a
+            // phone, the `backable` path below does, past the size other images are capped at).
+            original_image = MakeImage(
+                runtime_.device, runtime_.memory_allocator, host_info,
+                IsHugeAstcArray(runtime_.device, info) ? std::span<const VkFormat>{HugeAstcViewFormats}
+                : IsOpaqueBc1Astc(runtime_.device, info)
+                    ? std::span<const VkFormat>{OpaqueAstcViewFormats}
+                    : runtime->ViewFormats(info.format),
+                AstcHostFormat(runtime_.device, info));
+            if (!original_image.IsUnbacked()) {
+                flags &= ~VideoCommon::ImageFlagBits::Unbacked;
+            }
         } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;
-        } else if (texels <= (u64{1} << 28)) {
+        } else if (texels <= (u64{1} << 28) ||
+                   (backable && IsUnwrittenSparse(runtime_.device, info, gpu_addr_))) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
             // was written there yet, so the first write gets it replaced.
             flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;
+        } else if (backable) {
+            vk::Image backed = MakeImage(
+                runtime_.device, runtime_.memory_allocator, host_info,
+                IsHugeAstcArray(runtime_.device, info) ? std::span<const VkFormat>{HugeAstcViewFormats}
+                : IsOpaqueBc1Astc(runtime_.device, info)
+                    ? std::span<const VkFormat>{OpaqueAstcViewFormats}
+                    : runtime->ViewFormats(info.format),
+                AstcHostFormat(runtime_.device, info), false, false, true);
+            if (backed && !backed.IsUnbacked()) {
+                LOG_INFO(Render_Vulkan, "{}x{}x{} image at {:#x} has no sparse residency here; "
+                                        "backing it whole",
+                         host_info.size.width, host_info.size.height, host_info.resources.layers,
+                         gpu_addr_);
+                original_image = std::move(backed);
+                flags &= ~VideoCommon::ImageFlagBits::Unbacked;
+            }
         }
     }
     if (host_level_offset != 0) {
@@ -3436,6 +3611,16 @@ bool Image::InitSparseLayers() {
         u64{granularity.width} * granularity.height * block_bytes == tile) {
         s.tile_width *= block_width;
         s.tile_height *= block_height;
+    }
+    // A block that is not one sparse page of this image can't be bound by (AMD gives 65549x339860304
+    // for the RGBA8 terrain arrays on an RX 9070 XT, which left most of their texels unbound).
+    if (s.tile_width < block_width || s.tile_height < block_height ||
+        u64{s.tile_width / block_width} * (s.tile_height / block_height) * block_bytes != tile) {
+        LOG_WARNING(Render_Vulkan,
+                    "Sparse layered image {:#x}: driver block {}x{} is not a {} byte page, backing "
+                    "it whole",
+                    gpu_addr, granularity.width, granularity.height, tile);
+        return false;
     }
     const u32 tail_lod = (std::min)(it->imageMipTailFirstLod, s.levels);
     VkDeviceSize bytes = 0;

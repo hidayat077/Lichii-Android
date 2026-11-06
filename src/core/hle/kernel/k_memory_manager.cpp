@@ -108,6 +108,7 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
 
         const size_t cur_size = manager->Initialize(region_address, region_size, management_region,
                                                     management_region_end, region_pool);
+        manager->SetOwner(this);
         management_region += cur_size;
         ASSERT(management_region <= management_region_end);
 
@@ -257,6 +258,17 @@ void KMemoryManager::MarkUsed(KPhysicalAddress address, size_t num_pages) {
 void KMemoryManager::MarkDirty(KPhysicalAddress address, size_t num_pages) {
     m_system.DeviceMemory().buffer.MarkDirty(GetInteger(address) - Core::DramMemoryMap::Base,
                                              num_pages * PageSize);
+}
+
+void KMemoryManager::ReleaseFreedPages([[maybe_unused]] KPhysicalAddress address,
+                                       [[maybe_unused]] size_t num_pages) {
+    // Pages returned to the pool (last reference closed, including after a GPU unmap) are not
+    // allocated to anyone: give their backing back to the OS on Android, where guest and GPU
+    // share the phone's RAM.
+#ifdef __ANDROID__
+    m_system.DeviceMemory().buffer.ReleaseBackingRegion(
+        GetInteger(address) - Core::DramMemoryMap::Base, num_pages * PageSize);
+#endif
 }
 
 Result KMemoryManager::AllocatePageGroupImpl(KPageGroup* out, size_t num_pages, Pool pool,
@@ -466,8 +478,7 @@ size_t KMemoryManager::Impl::Initialize(KPhysicalAddress address, size_t size,
     // Setup region.
     m_pool = p;
     m_management_region = management;
-    m_page_reference_counts.resize(
-        Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() / PageSize);
+    m_page_reference_counts.resize(size / PageSize);
     ASSERT(Common::IsAligned(GetInteger(m_management_region), PageSize));
 
     // Initialize the manager's KPageHeap.
