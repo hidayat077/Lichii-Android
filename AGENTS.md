@@ -2,6 +2,15 @@
 
 See `docs/Coding.md` for technical coding guidance.
 
+## Fork notes (hidayat077)
+
+This is a personal fork. These notes take priority over the sections below where they conflict.
+
+- The sections "Live debug server", "RenderDoc and the live server", "How work is split" and "Builds" describe the original owner's Windows PC and tooling. They do not apply here. Do not try to use those scripts, paths or models.
+- This fork is built by GitHub Actions (`.github/workflows/android.yml`) on every push. There is no local Android SDK or NDK. If you cannot build or test, say so. Never claim a change was tested.
+- No emulator, game files or debug server are available on this machine.
+- Never run `git push`, create pull requests, or merge upstream without explicit approval. Commit only on a feature branch created from `nx2`.
+- Documentation-only commits end with `[skip ci]`.
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
 ## Game bug reports
