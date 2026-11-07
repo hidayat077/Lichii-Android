@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,6 +24,20 @@ TEST_CASE("Ampere guarded ULEA without .HI or a carry out lowers", "[video_core]
         auto carry = lea;
         carry.words[2] &= ~(7U << 17);
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(std::array{carry, Exit})));
+    }
+}
+
+TEST_CASE("Ampere unsigned clamp idiom through any UPn lowers to IMNMX.U32", "[video_core][ampere]") {
+    for (u32 up = 0; up <= 6; ++up) {
+        const Instruction uisetp{{0x0400788c, 0x5, 0x0bf01070U | (up << 17), 0}};
+        const Instruction usel{{0x04047887, 0x5, 0x08000000U | (up << 23), 0}};
+        const auto lowered = LowerToMaxwell(std::array{uisetp, usel, Exit});
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const bool has_imnmx = std::any_of(
+            lowered.instructions.begin(), lowered.instructions.end(),
+            [](u64 word) { return (word & 0xffff000000000000ULL) == 0x3820000000000000ULL; });
+        REQUIRE(has_imnmx);
     }
 }
 } // namespace
