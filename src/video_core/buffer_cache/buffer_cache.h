@@ -224,6 +224,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         }
         DownloadMemory(page_begin, page_end - page_begin);
     }
+    read_trapped_ranges.Subtract(page_begin, page_end - page_begin);
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
 }
@@ -270,12 +271,11 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
     DAddr device_addr_end_aligned = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
     area->start_address = device_addr_start_aligned;
     area->end_address = device_addr_end_aligned;
-    if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
-        area->preemtive = true;
-        return area;
-    };
     area->preemtive = !IsRegionGpuModified(device_addr_start_aligned,
                                            device_addr_end_aligned - device_addr_start_aligned);
+    if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
+        return area;
+    }
     // Mark only data that the GPU wrote. A mark stays for the session and sends later GPU writes
     // in the range to a download at each fence.
     if (!area->preemtive) {
@@ -682,7 +682,7 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     const auto& cbufs = launch_desc.const_buffer_config;
     const GPUVAddr ssbo_addr = cbufs[cbuf_index].Address() + cbuf_offset;
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsDlssDispatch());
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode());
 }
 
 template <class P>
@@ -2674,8 +2674,6 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         // A native (Switch 2) compute program's pointer is bare: the word after it is another
         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
-        // Only DLSS passes size from the mapping: doing it for every native dispatch binds up to
-        // 8 MiB per buffer and slows Hyrule Warriors' fights to a few fps, then hangs them.
         if (native_pointer) {
             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }

@@ -637,15 +637,22 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
-        u64 armed_bytes = 0;
+        DAddr cursor = begin;
+        bool armed_any = false;
         read_trapped_ranges.ForEachInRange(begin, end - begin, [&](DAddr lower, DAddr upper) {
-            armed_bytes += upper - lower;
+            if (cursor < lower) {
+                device_memory.ArmReadTraps(cursor, lower - cursor);
+                armed_any = true;
+            }
+            cursor = upper;
         });
-        if (armed_bytes == end - begin) {
-            return;
+        if (cursor < end) {
+            device_memory.ArmReadTraps(cursor, end - cursor);
+            armed_any = true;
         }
-        read_trapped_ranges.Add(begin, end - begin);
-        device_memory.ArmReadTraps(begin, end - begin);
+        if (armed_any) {
+            read_trapped_ranges.Add(begin, end - begin);
+        }
     }
 
     Common::RangeSet<DAddr> read_trapped_ranges;

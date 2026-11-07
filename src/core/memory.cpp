@@ -509,6 +509,7 @@ struct Memory::Impl {
             }();
             const bool reactive_flushing =
                 Settings::values.use_reactive_flushing.GetValue() &&
+                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce &&
                 !(nx2_no_reactive && Settings::CurrentProgramIsSwitch2());
             if (!reactive_flushing || !cached) {
                 perm |= Common::MemoryPermission::Read;
@@ -519,6 +520,8 @@ struct Memory::Impl {
             host_buffer->Protect(vaddr, size, perm);
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
+            } else if (!cached) {
+                ClearArmedPages(vaddr, size);
             }
         }
 
@@ -582,16 +585,15 @@ struct Memory::Impl {
 
     /// Read traps replace reactive flushing's blanket read protection of every cached page: only
     /// pages the GPU writes are protected, and each one only until its first read
-    /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
-    /// are not used there.
+    /// (EDEN_NX2_READ_TRAPS=0 turns them off).
     bool ReadTrapsEnabled() const {
         static const bool disabled = [] {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
         }();
         return !disabled && current_page_table->fastmem_arena &&
-               !Settings::values.use_reactive_flushing.GetValue() &&
-               Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
+               (!Settings::values.use_reactive_flushing.GetValue() ||
+                Settings::values.cpu_backend.GetValue() == Settings::CpuBackend::Nce);
     }
 
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
@@ -667,6 +669,32 @@ struct Memory::Impl {
                                  Common::MemoryPermission::Read);
             it = armed_read_traps.erase(it);
             armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    void ClearArmedPages(u64 vaddr, u64 size) {
+        if (armed_read_trap_count.load(std::memory_order_relaxed) == 0) {
+            return;
+        }
+        std::scoped_lock lk{read_trap_mutex};
+        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        auto it = armed_read_traps.lower_bound(vaddr >> YUZU_PAGEBITS);
+        while (it != armed_read_traps.end() && *it < page_end) {
+            it = armed_read_traps.erase(it);
+            armed_read_trap_count.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    void EnsureCachedReadPermission(u64 vaddr, size_t size) {
+        std::scoped_lock lk{read_trap_mutex};
+        const u64 page_end = ((vaddr + size - 1) >> YUZU_PAGEBITS) + 1;
+        for (u64 page = vaddr >> YUZU_PAGEBITS; page != page_end; ++page) {
+            if (std::as_const(current_page_table->entries)[page].Type() ==
+                    Common::PageType::RasterizerCachedMemory &&
+                !armed_read_traps.contains(page)) {
+                host_buffer->Protect(page << YUZU_PAGEBITS, YUZU_PAGESIZE,
+                                     Common::MemoryPermission::Read);
+            }
         }
     }
 
@@ -899,8 +927,8 @@ struct Memory::Impl {
             }
             Common::ScratchBuffer<u32> scratch;
             gpu_device_memory->ApplyOpOnPointer(p, scratch, [&](DAddr address) {
-                DisarmReadTraps(v_address, size);
                 (void)system.GPU().OnCPURead(address, size);
+                DisarmReadTraps(v_address, size);
             });
             return;
         }
@@ -914,10 +942,11 @@ struct Memory::Impl {
             const DAddr end_address = address + size;
             if (current_area.start_address <= address && end_address <= current_area.end_address)
                 [[likely]] {
+                DisarmReadTraps(v_address, size);
                 return;
             }
-            DisarmReadTraps(v_address, size);
             current_area = system.GPU().OnCPURead(address, size);
+            DisarmReadTraps(v_address, size);
         });
     }
 
@@ -1203,7 +1232,7 @@ void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug)
     impl->MarkRegionDebug(GetInteger(vaddr), size, debug);
 }
 
-bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
+bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size, bool is_write) {
     [[maybe_unused]] bool mapped = true;
     [[maybe_unused]] bool rasterizer = false;
 
@@ -1216,11 +1245,19 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
         },
         [&] { rasterizer = true; });
     if (rasterizer) {
-        impl->InvalidateGPUMemory(ptr, size);
+        if (!is_write) {
+            if (impl->ReadTrapArmed(GetInteger(vaddr), size)) {
+                impl->HandleRasterizerDownload(GetInteger(vaddr), size);
+            } else {
+                impl->EnsureCachedReadPermission(GetInteger(vaddr), size);
+            }
+        } else {
+            impl->InvalidateGPUMemory(ptr, size);
+        }
     }
 
 #ifdef __ANDROID__
-    if (!rasterizer && mapped) {
+    if (mapped) {
         impl->host_buffer->DeferredMapSeparateHeap(GetInteger(vaddr));
     }
 #endif

@@ -41,6 +41,21 @@ fpsimd_context* GetFloatingPointState(mcontext_t& host_ctx) {
     return reinterpret_cast<fpsimd_context*>(header);
 }
 
+bool IsWriteFault(const mcontext_t& host_ctx) {
+    const auto* header = reinterpret_cast<const _aarch64_ctx*>(&host_ctx.__reserved);
+    while (header->magic != 0 && header->size != 0) {
+        if (header->magic == ESR_MAGIC) {
+            const u64 esr = reinterpret_cast<const esr_context*>(header)->esr;
+            // ESR_EL1 Data Abort ISS: WnR (bit 6) is set for writes, CM (bit 8) for cache
+            // maintenance.
+            return (esr & ((1ULL << 6) | (1ULL << 8))) != 0;
+        }
+        header = reinterpret_cast<const _aarch64_ctx*>(reinterpret_cast<const char*>(header) +
+                                                       header->size);
+    }
+    return true;
+}
+
 using namespace Common::Literals;
 constexpr u32 StackSize = 128_KiB;
 
@@ -158,6 +173,7 @@ bool ArmNce::HandleGuestAlignmentFault(GuestContext* guest_ctx, void* raw_info, 
 }
 
 bool ArmNce::HandleGuestAccessFault(GuestContext* guest_ctx, void* raw_info, void* raw_context) {
+    auto& host_ctx = static_cast<ucontext_t*>(raw_context)->uc_mcontext;
     auto* info = static_cast<siginfo_t*>(raw_info);
 
     // Try to handle an invalid access.
@@ -165,7 +181,7 @@ bool ArmNce::HandleGuestAccessFault(GuestContext* guest_ctx, void* raw_info, voi
     const Common::ProcessAddress addr =
         (reinterpret_cast<u64>(info->si_addr) & ~Memory::YUZU_PAGEMASK);
     auto& memory = guest_ctx->parent->m_running_thread->GetOwnerProcess()->GetMemory();
-    if (memory.InvalidateNCE(addr, Memory::YUZU_PAGESIZE)) {
+    if (memory.InvalidateNCE(addr, Memory::YUZU_PAGESIZE, IsWriteFault(host_ctx))) {
         // We handled the access successfully and are returning to guest code.
         return true;
     }
